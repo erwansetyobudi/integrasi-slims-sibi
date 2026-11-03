@@ -26,6 +26,7 @@ require SIMBIO . 'simbio_DB/datagrid/simbio_dbgrid.inc.php';
 
 // privileges checking
 $can_read = utility::havePrivilege('bibliography', 'r');
+$can_write = utility::havePrivilege('bibliography', 'w');
 
 if (!$can_read) {
     die('<div class="errorBox">' . __('You are not authorized to view this section') . '</div>');
@@ -48,6 +49,7 @@ function pluginQuery()
 }
 
 require_once __DIR__ . '/vendor/autoload.php';
+require_once __DIR__ . '/sibi_media.php';
 
 // SIBI API base URI
 $base_uri = 'https://api.buku.cloudapp.web.id/';
@@ -224,11 +226,15 @@ if ($action === 'syncbiblio') {
     try {
         // insert base biblio data
         $inserted_rows = $pdo->exec(<<<SQL
-            REPLACE INTO biblio (
+            INSERT INTO biblio (
                 source, gmd_id, content_type_id, media_type_id, carrier_type_id, title, sor, image, notes, publish_year, classification, 
                 isbn_issn, `collation`, edition, spec_detail_info, input_date, last_update, sibi_doc_id
-            ) SELECT 'SIBI', 1, 20, 2, 16, title, writer, image, description, YEAR(published_year), class, 
+            ) SELECT 'SIBI', 1, 20, 2, 16, title, writer, NULL, description, YEAR(published_year), class, 
                 isbn, `collation`, edition, category, created_at, updated_at, id FROM sibi_docs
+            ON DUPLICATE KEY UPDATE
+                title=VALUES(title), sor=VALUES(sor), notes=VALUES(notes),
+                publish_year=VALUES(publish_year), isbn_issn=VALUES(isbn_issn),
+                last_update=NOW()
         SQL);
 
         // insert authors data
@@ -311,131 +317,36 @@ if ($action === 'syncbiblio') {
     exit();
 }
 
-if ($action === 'downloadfiles') {
-
-    $sql = 'SELECT * FROM sibi_docs LIMIT 10000';
-    $failed = 0;
-    $success = 0;
-    $error = '';
-    $client = new Client();
-    // statement for files table insertion
-    $file_stmt = $pdo->prepare("INSERT INTO files (file_title , file_name, file_url, file_dir, mime_type) 
-        VALUES (:file_title , :file_name, :file_url, :file_dir, :mime_type)");
-
-    // query the sibi docs data
-    foreach ($pdo->query($sql) as $row) {
-        $fileUrl = $row['attachment'];
-        $pdfName = urldecode( basename($row['attachment']) );
-        $saveTo  = REPOBS . 'sibi_docs/' . $pdfName;
-        
-        try {
-            // Use 'sink' to write the response directly to a file
-            // This is memory efficient for large PDFs
-            $response = $client->request('GET', $fileUrl, [
-                'sink' => $saveTo,
-                'verify' => true, // Set to false only if you have local SSL issues
-            ]);
-
-            // insert into files table
-            $file_stmt->execute([
-                ':file_title' => $row['title'], 
-                ':file_name' => $pdfName, 
-                ':file_url' => $fileUrl, 
-                ':file_dir' => 'sibi_docs', 
-                ':mime_type' => 'application/pdf' 
-            ]);
-
-            $success++;
-        } catch (RequestException $e) {
-            $failed++;
-            $error = $e->getMessage();
-        }
+// One small request per book: browser repeats this endpoint for a resumable batch.
+if ($action === 'media_batch') {
+    header('Content-Type: application/json; charset=utf-8');
+    if (!$can_write || $_SERVER['REQUEST_METHOD'] !== 'POST' || !hash_equals($_SESSION['sibi_media_token'] ?? '', $_POST['token'] ?? '')) {
+        http_response_code(403); echo json_encode(['ok'=>false,'error'=>'Akses ditolak / token tidak valid']); exit;
     }
-
-    if ($success) {
-        utility::jsToastr('SIBI', "$success PDF files(s) successfully downloaded", 'success');
-    }
-
-    if ($failed) {
-        utility::jsToastr('SIBI', "$failed PDF files(s) failed to download caused by: $error", 'error');
-    }
-    exit();
+    $id=(int)($_POST['sibi_doc_id'] ?? 0);
+    try { $out=sibi_media_process($pdo,$id,(int)$_SESSION['uid']); echo json_encode(['ok'=>true,'id'=>$id,'result'=>$out]); }
+    catch (Throwable $e) { echo json_encode(['ok'=>false,'id'=>$id,'error'=>$e->getMessage()]); }
+    exit;
 }
-
+if ($action === 'media_ids') {
+    header('Content-Type: application/json; charset=utf-8');
+    if (!$can_write || $_SERVER['REQUEST_METHOD'] !== 'POST' || !hash_equals($_SESSION['sibi_media_token'] ?? '', $_POST['token'] ?? '')) {
+        http_response_code(403); echo json_encode(['ok'=>false,'error'=>'Akses ditolak']); exit;
+    }
+    $ids=$pdo->query("SELECT s.id FROM sibi_docs s INNER JOIN biblio b ON b.sibi_doc_id=s.id WHERE (s.image IS NOT NULL AND s.image<>'') OR (s.attachment IS NOT NULL AND s.attachment<>'') ORDER BY s.id")->fetchAll(PDO::FETCH_COLUMN);
+    echo json_encode(['ok'=>true,'ids'=>array_map('intval',$ids)]); exit;
+}
 if ($action === 'downloadfile') {
-    if (!isset($_GET['sibi_doc_id']) || empty($_GET['sibi_doc_id'])) {
-        exit();
-    }
-
-    $failed = 0;
-    $success = 0;
-    $error = '';
-
-    // query the sibi doc data
-    $doc_sql = 'SELECT sb.*, b.biblio_id FROM sibi_docs AS sb 
-        LEFT JOIN biblio AS b ON sb.id=b.sibi_doc_id 
-        WHERE sb.id=:id';
-    $doc = $pdo->prepare($doc_sql);
-    $doc->execute(['id' => $_GET['sibi_doc_id']]);
-    $row = $doc->fetch(PDO::FETCH_ASSOC);
-
-    // statement for files table insertion
-    $file_stmt = $pdo->prepare("INSERT INTO files (file_title , file_name, file_url, file_dir, mime_type, input_date, last_update, uploader_id) 
-        VALUES (:file_title , :file_name, :file_url, :file_dir, :mime_type, NOW(), NOW(), :uploader_id)");
-    $biblio_att_stmt = $pdo->prepare("INSERT IGNORE INTO biblio_attachment (file_id , biblio_id, placement , access_type) 
-        VALUES (:file_id , :biblio_id, 'popup', 'public')");
-
-    $fileUrl = $row['attachment'];
-    $biblio_id = $row['biblio_id'];
-    $pdfName = urldecode( basename($fileUrl) );
-    $saveTo  = REPOBS . 'sibi_docs/' . $pdfName;
-
-    $client = new Client();
-    
+    if (!$can_write) { http_response_code(403); exit; }
     try {
-        // Use 'sink' to write the response directly to a file
-        $response = $client->request('GET', $fileUrl, [
-            'sink' => $saveTo,
-            'verify' => true, // Set to false only if you have local SSL issues
-        ]);
-
-        // insert into files table
-        $file_stmt->execute([
-            'file_title' => $row['title'], 
-            'file_name' => $pdfName, 
-            'file_url' => $fileUrl, 
-            'file_dir' => 'sibi_docs', 
-            'mime_type' => 'application/pdf',
-            'uploader_id' => $_SESSION['uid']
-        ]);
-
-        // insert biblio attachment
-        if ($biblio_id) {
-            $file_id = $pdo->lastInsertId();
-            $biblio_att_stmt->execute([
-                'file_id' => $file_id,
-                'biblio_id' => $biblio_id
-            ]);
-        }
-
-        $success++;
-    } catch (RequestException $e) {
-        $failed++;
-        $error = $e->getMessage();
-    }
-
-    if ($success) {
-        utility::jsToastr('SIBI', "Berkas dokumen berhasil diunduh", 'success');
-    }
-
-    if ($failed) {
-        utility::jsToastr('SIBI', "Berkas dokumen GAGAL diunduh karena: $error", 'error');
-    }
-    echo '<script type="text/javascript">parent.jQuery(\'#mainContent\').simbioAJAX(\''.$self_url.'\');</script>';
-    exit();
+        $out=sibi_media_process($pdo,(int)($_GET['sibi_doc_id']??0),(int)$_SESSION['uid']);
+        utility::jsToastr('SIBI','Cover dan PDF diproses: '.implode(', ',$out),'success');
+    } catch (Throwable $e) { utility::jsToastr('SIBI',htmlspecialchars($e->getMessage(),ENT_QUOTES,'UTF-8'),'error'); }
+    echo '<script>parent.jQuery("#mainContent").simbioAJAX('.json_encode($self_url).');</script>'; exit;
 }
 
 // check number of docs in sibi_docs table
+if (empty($_SESSION['sibi_media_token'])) $_SESSION['sibi_media_token']=bin2hex(random_bytes(24));
 $sibi_records = 0;
 $stmt = $pdo->prepare('SELECT COUNT(id) as total FROM sibi_docs');
 $stmt->execute();
@@ -455,8 +366,10 @@ $sibi_records = $stmt->fetchColumn();
                 <?php if ($sibi_records > 0) : ?>
                     <a target="blindSubmit" href="<?= $_SERVER['PHP_SELF'] . '?' . httpQuery(['action' => 'syncbiblio']) ?>"
                     class="btn btn-primary"><?php echo __('Sync Metadata SIBI ke SLiMS'); ?></a>
-                    <!-- <a target="blindSubmit" href="<?= $_SERVER['PHP_SELF'] . '?' . httpQuery(['action' => 'downloadfiles']) ?>"
-                    class="btn btn-info"><?php echo __('Download Files to SLiMS'); ?></a> -->
+                    <?php if ($can_write): ?>
+                    <button type="button" id="sibiBulkStart" class="btn btn-info">Unduh Cover + PDF Massal</button>
+                    <button type="button" id="sibiBulkStop" class="btn btn-secondary" disabled>Hentikan</button>
+                    <?php endif; ?>
                     <a target="blindSubmit" href="<?= $_SERVER['PHP_SELF'] . '?' . httpQuery(['action' => 'clearcache']) ?>"
                     class="btn btn-warning"><?php echo __('Bersihkan Cache SIBI'); ?></a>
                 <?php endif; ?>
@@ -473,12 +386,13 @@ $sibi_records = $stmt->fetchColumn();
                 <input type="submit" id="doSearch" value="<?php echo __('Search'); ?>" class="s-btn btn btn-default"/>
             </form>
         </div>
-        <div class="infoBox">Cari data SIBI yang sudah di-harvest</div>
+        <div class="infoBox">Cari data SIBI yang sudah di-harvest. Sinkronkan bibliografi sebelum mengunduh media.</div>
+        <div id="sibiBulkProgress" style="padding:10px;display:none;border:1px solid #ddd;margin-top:8px" aria-live="polite"></div>
         <?php
         if (!file_exists( REPOBS . 'sibi_docs' )) {
             echo '<div class="errorBox">Direktori <strong>sibi_docs</strong> untuk menyimpan file dokumen 
-            belum ada di bawah direktori <strong>repository</strong>. Pastikan direktori <strong>sibi_docs</strong>
-            sudah ada dan mendapat hak akses tulis (<em>write</em>) oleh SLiMS.
+            belum ada di bawah direktori <strong>repository</strong>. Plugin akan mencoba membuatnya otomatis.
+            Pastikan direktori repository mendapat hak akses tulis oleh SLiMS.
             </div>';
         }
         ?>
@@ -584,3 +498,39 @@ if (isset($_GET['keywords']) AND $_GET['keywords']) {
 }
 echo $datagrid_result;
 /* main content end */
+
+?><?php if ($can_write): ?>
+<script>
+(function(){
+  var start=document.getElementById('sibiBulkStart'), stop=document.getElementById('sibiBulkStop'), panel=document.getElementById('sibiBulkProgress');
+  if(!start||!stop||!panel)return;
+  var stopped=false, token=<?= json_encode($_SESSION['sibi_media_token']) ?>;
+  var base=<?= json_encode($_SERVER['PHP_SELF'].'?'.pluginQuery()) ?>;
+  function endpoint(action){return base+'&action='+encodeURIComponent(action)}
+  async function post(action, fields){
+    var body=new URLSearchParams(Object.assign({token:token},fields||{}));
+    var r=await fetch(endpoint(action),{method:'POST',body:body,credentials:'same-origin'});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    return await r.json();
+  }
+  stop.onclick=function(){stopped=true;stop.disabled=true;};
+  start.onclick=async function(){
+    if(!confirm('Unduh cover dan PDF untuk semua bibliografi SIBI yang telah disinkronkan? Proses dapat berlangsung lama dan menggunakan ruang disk.'))return;
+    start.disabled=true;stop.disabled=false;stopped=false;panel.style.display='block';
+    var success=0,failed=0, errors=[];
+    try {
+      var data=await post('media_ids'); if(!data.ok)throw new Error(data.error||'Tidak bisa membaca daftar');
+      var ids=data.ids||[];
+      for(var i=0;i<ids.length&&!stopped;i++){
+        panel.textContent='Memproses '+(i+1)+' / '+ids.length+' | Berhasil: '+success+' | Gagal: '+failed;
+        try {var out=await post('media_batch',{sibi_doc_id:ids[i]});
+          if(out.ok)success++;else{failed++;errors.push('#'+ids[i]+': '+out.error);}
+        } catch(e){failed++;errors.push('#'+ids[i]+': '+e.message);}
+      }
+      panel.textContent=(stopped?'Dihentikan. ':'Selesai. ')+'Berhasil: '+success+', gagal: '+failed+'. '+errors.slice(0,8).join(' | ');
+    }catch(e){panel.textContent='Gagal: '+e.message;}
+    start.disabled=false;stop.disabled=true;
+  };
+})();
+</script>
+<?php endif; ?>

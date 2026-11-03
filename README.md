@@ -17,3 +17,16 @@ Plugin untuk mengintegrasikan metadata SIBI (Sistem Informasi Perbukuan Indonesi
 4. Agar hasil sinkronisasi metadata bisa dicari, lakukan pengindeksan bibliografis melalui menu System -> Biblio Indexes. Klik pada tombol Update Index pada pojok kanan atas.
 5. Setelah proses sinkronisasi selesai, selanjutnya file e-book setiap metadata yang diimpor bisa diunduh satu per satu dengan menekan tombol "Unduh" pada setiap baris. Proses download setiap koleksi digital dapat memakan waktu yang cukup lama.
 
+
+## Pembaruan: Unduh cover dan PDF secara massal
+
+1. **Backup database dan direktori repository/images** sebelum memperbarui plugin.
+2. Ganti folder plugin lama dengan folder ini, pertahankan migrasi dan data lama. Tidak perlu menjalankan ulang migrasi pada instalasi yang sudah aktif.
+3. Pilih **Harvest Metadata SIBI** kemudian **Sync Metadata SIBI ke SLiMS**.
+4. Klik **Unduh Cover + PDF Massal**. Browser memproses satu buku per permintaan dan menampilkan progres, keberhasilan, dan kesalahan. Biarkan halaman tetap terbuka. Tombol **Hentikan** menghentikan setelah buku yang sedang diproses selesai.
+5. Berkas cover disimpan di `images/docs/sibi_<ID>.<ekstensi>` dan direferensikan pada `biblio.image`. PDF disimpan di `repository/sibi_docs/sibi_<ID>.pdf`, didaftarkan pada `files` dan dihubungkan ke `biblio_attachment`.
+6. Jalankan **System → Biblio Indexes → Update Index** agar perubahan muncul konsisten dalam pencarian/OPAC.
+
+Proses dapat diulang: file yang sudah ada tidak diunduh ulang, dan relasi PDF dicek sebelum ditambahkan. Sinkronisasi bibliografi tidak lagi menggunakan `REPLACE INTO` yang dapat mengganti `biblio_id` dan menghilangkan relasi lama. Metadata dan file yang sudah dikurasi tidak ditimpa oleh proses pengunduhan.
+
+**Persyaratan:** ekstensi PHP cURL/SSL yang valid, direktori `images/docs` dan `repository/sibi_docs` dapat ditulis oleh server, koneksi HTTPS ke host media SIBI. Unduhan dibatasi ke `static.sc.cloudapp.web.id` dan `static-sc.cloudapp.web.id` dan divalidasi sebagai PDF/gambar. Plugin tidak mengubah hak cipta atau izin akses sumber; periksa ketentuan penggunaan sumber sebelum menyediakan berkas secara publik. Pengujian end-to-end pada server tujuan tetap diperlukan.

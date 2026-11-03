@@ -13,6 +13,9 @@ class CreateSibiDocs extends \SLiMS\Migration\Migration
      */
     function up()
     {
+        $pdo = DB::getInstance();
+        // Aman untuk instalasi baru maupun database yang pernah memasang SIBI.
+        if (!$this->hasTable($pdo, 'sibi_docs')) {
         Schema::create('sibi_docs', function (Blueprint $table) {
             // Engine and Collation
             $table->engine = 'MyISAM';
@@ -80,26 +83,34 @@ class CreateSibiDocs extends \SLiMS\Migration\Migration
             $table->index('category');
         });
 
-        Schema::table('biblio', function (Blueprint $table) {
-            $table->number('sibi_doc_id')->add();
-            $table->unique('sibi_doc_id')->add();
-            $table->string('image', 255)->nullable()->change();
-        });
+        } // end create table when absent
+        if (!$this->hasColumn($pdo, 'biblio', 'sibi_doc_id')) {
+            // NULL for existing records, avoids unique-index collisions with default 0.
+            $pdo->exec('ALTER TABLE `biblio` ADD COLUMN `sibi_doc_id` BIGINT NULL DEFAULT NULL');
+        }
+        if (!$this->hasIndex($pdo, 'biblio', 'sibi_doc_id_unq') && !$this->hasUniqueColumnIndex($pdo, 'biblio', 'sibi_doc_id')) {
+            $pdo->exec('ALTER TABLE `biblio` ADD UNIQUE KEY `sibi_doc_id_unq` (`sibi_doc_id`)');
+        }
+        // Do not ALTER core image columns: this is unnecessary for storing cover filenames.
 
-        Schema::table('search_biblio', function (Blueprint $table) {
-            $table->string('image', 255)->nullable()->change();
-        });
     }
 
-    /**
-     * Reverse the migrations.
-     *
-     * @return void
-     */
-    function down()
-    {
-        Schema::drop('sibi_docs');
-        Schema::dropColumn('biblio', 'sibi_doc_id');
-        Schema::dropIndex('biblio', 'sibi_doc_id_unq');
+    private function hasTable($pdo, $name) {
+        $q = $pdo->prepare('SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?');
+        $q->execute([$name]); return (bool)$q->fetchColumn();
     }
+    private function hasColumn($pdo, $table, $column) {
+        $q = $pdo->prepare('SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?');
+        $q->execute([$table,$column]); return (bool)$q->fetchColumn();
+    }
+    private function hasIndex($pdo, $table, $name) {
+        $q = $pdo->prepare('SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME = ?');
+        $q->execute([$table,$name]); return (bool)$q->fetchColumn();
+    }
+    private function hasUniqueColumnIndex($pdo, $table, $column) {
+        $q = $pdo->prepare('SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ? AND NON_UNIQUE = 0');
+        $q->execute([$table,$column]); return (bool)$q->fetchColumn();
+    }
+    /** Rollback deliberately non-destructive to preserve imported bibliographies. */
+    function down() { /* No destructive changes on disable/uninstall. */ }
 }
